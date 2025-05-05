@@ -1,0 +1,103 @@
+// main/main.cpp
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+#include "model_data.h"  // your xxd/bin2c output
+
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/version.h"
+
+static const char* TAG = "ESP3EYE";
+
+#define PIR_PIN        GPIO_NUM_2
+#define UART_TX_PIN    GPIO_NUM_17
+#define UART_RX_PIN    GPIO_NUM_16
+
+#define GESTURE_WINDOW_MS 15000  // 15 seconds
+
+// TFLM globals
+constexpr int kTensorArenaSize = 40 * 1024;
+uint8_t tensor_arena[kTensorArenaSize];
+tflite::MicroErrorReporter micro_error_reporter;
+tflite::ErrorReporter* error_reporter = &micro_error_reporter;
+tflite::AllOpsResolver resolver;
+const tflite::Model* model = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+
+extern "C" void app_main() {
+    // 1) Setup UART1 to Mega
+    const uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    uart_param_config(UART_NUM_1, &uart_config);
+    uart_set_pin(UART_NUM_1, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(UART_NUM_1, 256, 0, 0, nullptr, 0);
+
+    // 2) Setup PIR
+    gpio_set_direction(PIR_PIN, GPIO_MODE_INPUT);
+
+    // 3) Load TFLite model
+    model = tflite::GetModel(model_data);
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        ESP_LOGE(TAG, "Model schema mismatch");
+        return;
+    }
+    static tflite::MicroInterpreter static_interpreter(
+        model, resolver, tensor_arena, kTensorArenaSize, error_reporter);
+    interpreter = &static_interpreter;
+    if (interpreter->AllocateTensors() != kTfLiteOk) {
+        ESP_LOGE(TAG, "AllocateTensors failed");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Ready. Awaiting motion...");
+
+    // 4) Main loop
+    while (true) {
+        // Wait for PIR trigger
+        if (gpio_get_level(PIR_PIN) == 1) {
+            ESP_LOGI(TAG, "Motion detected, listening for 'yes'...");
+            // Give user time to speak
+            uint32_t start = esp_log_timestamp();
+            bool heard_yes = false;
+
+            while ((esp_log_timestamp() - start) < GESTURE_WINDOW_MS) {
+                // TODO: capture audio/frame from mic or camera and preprocess
+                // Fill input tensor here:
+                // TfLiteTensor* input = interpreter->input(0);
+                // preprocess_audio_or_frame_to(input->data.f, ...);
+
+                if (interpreter->Invoke() != kTfLiteOk) {
+                    ESP_LOGE(TAG, "Inference error");
+                    break;
+                }
+                TfLiteTensor* output = interpreter->output(0);
+                float score = output->data.f[0];  // assume index 0 = “yes”
+                if (score > 0.8f) {
+                    heard_yes = true;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+
+            // Send result to Mega
+            const char* msg = heard_yes ? "YES\n" : "TIMEOUT\n";
+            uart_write_bytes(UART_NUM_1, msg, strlen(msg));
+            ESP_LOGI(TAG, "Sent to Mega: %s", msg);
+
+            // Debounce next motion
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
